@@ -18,10 +18,15 @@
 // https://github.com/ClickHouse/ClickHouse/blob/master/src/Functions/Modulo.cpp
 // and modified by Doris
 
-#include <string.h>
+#if USE_AVX2
+#define LIBDIVIDE_AVX2
+#endif
+#include <libdivide.h>
 
 #include <cmath>
+#include <cstring>
 #include <memory>
+#include <ranges>
 #include <utility>
 
 #include "runtime/decimalv2_value.h"
@@ -75,6 +80,107 @@ struct ModuloImpl {
         return a % (b + DecimalV2Value(is_null));
     }
 };
+
+/* template <typename A, typename B>
+struct ModuloImpl {
+    using ResultType = typename NumberTraits::ResultOfModulo<A, B>::Type;
+    using Traits = NumberTraits::BinaryOperatorTraits<A, B>;
+
+    template <typename Result = ResultType>
+    static void apply(const typename Traits::ArrayA& a, B b,
+                      typename ColumnVector<Result>::Container& c,
+                      typename Traits::ArrayNull& null_map) {
+        size_t size = c.size();
+        UInt8 is_null = b == 0;
+        memset(null_map.data(), is_null, sizeof(UInt8) * size);
+        if (is_null) {
+            return;
+        }
+
+        if constexpr (std::is_integral_v<A> && std::is_integral_v<B>) {
+            // Modulo of division by negative number is the same as the positive number.
+            if (std::is_signed_v<B> && b < 0) {
+                b = -b;
+            }
+            // Modulo with too small divisor.
+            [[unlikely]] if (b == 1) {
+                std::ranges::fill(c, 0);
+                return;
+            }
+
+            // Modulo with too large divisor.
+            [[unlikely]] if (b > std::numeric_limits<A>::max()) {
+                for (size_t i = 0; i < size; ++i) {
+                    c[i] = static_cast<Result>(a[i]);
+                }
+                return;
+            }
+
+            if ((b & (b - 1)) == 0) {
+                // Modulo with pow2.
+                auto mask = b - 1;
+                for (size_t i = 0; i < size; ++i) {
+                    c[i] = static_cast<Result>(a[i] & mask);
+                }
+                return;
+            }
+
+            using DivType = decltype(a[0] / b);
+            // Used to fit Int8/UInt8.
+            using Promoted = std::conditional_t<(sizeof(DivType) > 1), DivType, Int16>;
+            constexpr bool use_lib = requires {
+                libdivide::dispatcher<Promoted, libdivide::BRANCHFULL>(static_cast<Promoted>(b))
+                        .divide(static_cast<Promoted>(a[0]));
+            };
+            if constexpr (use_lib) {
+                libdivide::divider<Promoted> d(static_cast<Promoted>(b));
+                for (size_t i = 0; i < size; ++i) {
+                    c[i] = static_cast<Result>(static_cast<Promoted>(a[i]) -
+                                               (static_cast<Promoted>(a[i]) / d) * b);
+                }
+                return;
+            }
+            for (size_t i = 0; i < size; ++i) {
+                c[i] = static_cast<Result>(a[i] % b);
+            }
+        } else {
+            static_assert(std::is_floating_point_v<Result>,
+                          "If one of the inputs is a floating-point number, result must be "
+                          "floating-point number.");
+            auto fb = static_cast<Result>(b);
+            for (size_t i = 0; i < size; ++i) {
+                c[i] = fast_fmod(static_cast<Result>(a[i]), fb);
+            }
+        }
+    }
+
+    template <typename Result = ResultType>
+    static Result apply(A a, B b, UInt8& is_null) {
+        is_null = b == 0;
+        b += is_null;
+
+        if constexpr (std::is_floating_point_v<Result>) {
+            return fast_fmod((double)a, (double)b);
+        } else {
+            return a % b;
+        }
+    }
+
+    template <typename Result = DecimalV2Value>
+    static inline DecimalV2Value apply(DecimalV2Value a, DecimalV2Value b, UInt8& is_null) {
+        is_null = b == DecimalV2Value(0);
+        return a % (b + DecimalV2Value(is_null));
+    }
+
+    template <std::floating_point T>
+    static T fast_fmod(T a, T b) {
+        /// This computation is similar to `fmod` but the latter is not inlined and has 40 times worse performance.
+        if constexpr (std::is_same_v<T, float>) {
+            return a - std::truncf(a / b) * b;
+        }
+        return a - std::trunc(a / b) * b;
+    }
+}; */
 
 template <typename A, typename B>
 struct PModuloImpl {
